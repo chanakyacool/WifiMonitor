@@ -287,4 +287,81 @@ enum Probe {
         r.rtt = num("base_rtt")
         return (r.dl == nil && r.ul == nil) ? nil : r
     }
+
+    /// Sequential (download, then upload) `networkQuality` run that streams live throughput.
+    /// networkQuality only prints its progress line to a terminal, so it runs under `script` (a pty).
+    /// `onLive(dlMbps, ulMbps)` fires on a background thread for every progress line.
+    /// `sawLive` is false when no progress line arrived (pty route unavailable) so callers can fall back.
+    static func speedTestLive(onLive: @escaping (Double, Double) -> Void) -> (result: SpeedResult?, sawLive: Bool) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        p.arguments = ["-q", "/dev/null", "/usr/bin/networkQuality", "-s"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return (nil, false) }
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 150, execute: killer)
+        defer { killer.cancel() }
+
+        let liveRx = try! NSRegularExpression(pattern: #"Downlink: ([\d.]+) ([KMG]?)bps.*?Uplink: ([\d.]+) ([KMG]?)bps"#)
+        func mbps(_ v: Double, _ prefix: String) -> Double {
+            switch prefix { case "G": return v * 1000; case "K": return v / 1000; case "": return v / 1e6; default: return v }
+        }
+        var all = "", pending = "", sawLive = false
+        let h = pipe.fileHandleForReading
+        while true {
+            let chunk = h.availableData
+            if chunk.isEmpty { break }
+            let s = String(decoding: chunk, as: UTF8.self)
+            all += s
+            pending += s
+            // Progress lines are separated by carriage returns; keep the trailing partial segment.
+            var parts = pending.components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+            pending = parts.removeLast()
+            for line in parts {
+                let ns = line as NSString
+                guard let m = liveRx.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+                      let dl = Double(ns.substring(with: m.range(at: 1))),
+                      let ul = Double(ns.substring(with: m.range(at: 3))) else { continue }
+                sawLive = true
+                onLive(mbps(dl, ns.substring(with: m.range(at: 2))), mbps(ul, ns.substring(with: m.range(at: 4))))
+            }
+        }
+        p.waitUntilExit()
+
+        func capture(_ pattern: String) -> (Double, String)? {
+            guard let rx = try? NSRegularExpression(pattern: pattern),
+                  let m = rx.firstMatch(in: all, range: NSRange(all.startIndex..., in: all)),
+                  let r1 = Range(m.range(at: 1), in: all), let v = Double(all[r1]) else { return nil }
+            let unit = m.numberOfRanges > 2 ? Range(m.range(at: 2), in: all).map { String(all[$0]) } ?? "" : ""
+            return (v, unit)
+        }
+        var r = SpeedResult()
+        r.dl = capture(#"Downlink capacity: ([\d.]+) ([KMG]?)bps"#).map { mbps($0.0, $0.1) }
+        r.ul = capture(#"Uplink capacity: ([\d.]+) ([KMG]?)bps"#).map { mbps($0.0, $0.1) }
+        // Responsiveness while the downlink is saturated — the figure the bufferbloat grade is built on.
+        r.rpm = capture(#"Downlink Responsiveness: .*?\| ([\d.]+) RPM"#)?.0 ?? capture(#"Uplink Responsiveness: .*?\| ([\d.]+) RPM"#)?.0
+        r.rtt = capture(#"Idle Latency: ([\d.]+) milliseconds"#)?.0
+        return ((r.dl == nil && r.ul == nil) ? nil : r, sawLive)
+    }
+}
+
+/// Live readings from the running speed test. Kept off `Monitor` so ~5 updates/sec only redraw the popup.
+@MainActor
+final class SpeedTestLive: ObservableObject {
+    static let shared = SpeedTestLive()
+    enum Phase { case idle, connecting, download, upload, done }
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var dl: Double = 0
+    @Published private(set) var ul: Double = 0
+
+    func begin() { dl = 0; ul = 0; phase = .connecting }
+    func finish() { phase = .done }
+    func update(dl: Double, ul: Double) {
+        guard phase != .done, phase != .idle else { return }   // late line after the run ended
+        self.dl = dl; self.ul = ul
+        phase = ul > 0 ? .upload : dl > 0 ? .download : .connecting
+    }
 }

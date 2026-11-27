@@ -685,7 +685,16 @@ final class Monitor: ObservableObject {
         lastSpeedTestError = nil
         defer { speedTestRunning = false }
         let c = current
-        guard let r = await Blocking.run({ Probe.speedTest() }) else {
+        let live = SpeedTestLive.shared
+        live.begin()
+        defer { live.finish() }
+        let r = await Blocking.run { () -> Probe.SpeedResult? in
+            let (r, sawLive) = Probe.speedTestLive { dl, ul in
+                Task { @MainActor in live.update(dl: dl, ul: ul) }
+            }
+            return sawLive ? r : Probe.speedTest()   // pty route unavailable → classic JSON run
+        }
+        guard let r else {
             lastSpeedTestError = "No result from networkQuality — check your internet connection and try again."
             addEvent(.scanError, "Speed test failed (no result from networkQuality)", ssid: c?.ssid)
             return
